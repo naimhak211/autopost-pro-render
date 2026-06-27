@@ -1223,7 +1223,6 @@ def backup_import():
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
-register_notification_routes(app, get_db, require_auth, require_admin, g, jsonify, request)
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=os.getenv("FLASK_DEBUG","false").lower()=="true")
