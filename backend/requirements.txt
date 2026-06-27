@@ -1,0 +1,12 @@
+flask==3.0.3
+flask-cors==4.0.1
+itsdangerous==2.2.0
+werkzeug==3.0.3
+apscheduler==3.10.4
+requests==2.32.3
+python-dotenv==1.0.1
+gunicorn==22.0.0
+google-auth==2.29.0
+google-api-python-client==2.131.0
+yt-dlp==2024.5.27
+anthropic==0.28.0
