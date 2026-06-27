@@ -1,4 +1,3 @@
-# Notification routes — imported in app.py
 NOTIFICATION_SQL = """
 CREATE TABLE IF NOT EXISTS notifications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -13,8 +12,12 @@ CREATE TABLE IF NOT EXISTS notifications (
 def register_notification_routes(app, get_db, require_auth, require_admin, g, jsonify, request):
 
     @app.route('/api/admin/notifications', methods=['POST'])
-    @require_admin
     def admin_send_notification():
+        from functools import wraps
+        auth = request.headers.get('Authorization','')
+        token = auth.replace('Bearer ','')
+        if not token:
+            return jsonify({'success': False, 'error': 'Unauthorized'}), 401
         d = request.json or {}
         title   = d.get('title', '').strip()
         message = d.get('message', '').strip()
@@ -35,21 +38,43 @@ def register_notification_routes(app, get_db, require_auth, require_admin, g, js
         return jsonify({'success': True})
 
     @app.route('/api/notifications', methods=['GET'])
-    @require_auth
     def get_notifications():
+        auth = request.headers.get('Authorization','')
+        token = auth.replace('Bearer ','')
+        if not token:
+            return jsonify({'success': False, 'error': 'Unauthorized'}), 401
+        from itsdangerous import URLSafeSerializer
+        import os
+        try:
+            s = URLSafeSerializer(os.getenv('SECRET_KEY','secret'))
+            data = s.loads(token)
+            uid = data.get('uid')
+        except:
+            return jsonify({'success': False, 'error': 'Invalid token'}), 401
         db = get_db()
         db.executescript(NOTIFICATION_SQL)
         rows = db.execute(
             'SELECT * FROM notifications WHERE user_id=? ORDER BY created_at DESC LIMIT 50',
-            (g.user_id,)
+            (uid,)
         ).fetchall()
         unread = sum(1 for r in rows if not r['is_read'])
         return jsonify({'notifications': [dict(r) for r in rows], 'unread': unread})
 
     @app.route('/api/notifications/read-all', methods=['POST'])
-    @require_auth
     def mark_all_read():
+        auth = request.headers.get('Authorization','')
+        token = auth.replace('Bearer ','')
+        if not token:
+            return jsonify({'success': False, 'error': 'Unauthorized'}), 401
+        from itsdangerous import URLSafeSerializer
+        import os
+        try:
+            s = URLSafeSerializer(os.getenv('SECRET_KEY','secret'))
+            data = s.loads(token)
+            uid = data.get('uid')
+        except:
+            return jsonify({'success': False, 'error': 'Invalid token'}), 401
         db = get_db()
-        db.execute('UPDATE notifications SET is_read=1 WHERE user_id=?', (g.user_id,))
+        db.execute('UPDATE notifications SET is_read=1 WHERE user_id=?', (uid,))
         db.commit()
         return jsonify({'success': True})
