@@ -641,7 +641,7 @@ def fb_oauth_start(pid):
         "client_id": profile["app_id"],
         "redirect_uri": redirect_uri,
         "state": state,
-        "scope": "pages_show_list,pages_read_engagement,pages_manage_posts,business_management",
+        "scope": "pages_show_list,pages_read_engagement,pages_manage_posts",
     }
     return redirect("https://www.facebook.com/v19.0/dialog/oauth?" + urllib.parse.urlencode(params))
 
