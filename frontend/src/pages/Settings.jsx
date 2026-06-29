@@ -121,7 +121,7 @@ export default function Settings() {
           {driveStatus?.email&&<span className="muted" style={{fontSize:12}}>{driveStatus.email}</span>}
           <label className="btn-outline sm" style={{cursor:"pointer",marginLeft:"auto"}}>
             {driveUploading?"⏳ Uploading...":"⬆ Upload JSON"}
-            <input type="file" accept=".json" style={{display:"none"}} onChange={handleDriveUpload} disabled={driveUploading}/>
+            <input type="file" accept=".json,application/json" style={{display:"none"}} onChange={handleDriveUpload} disabled={driveUploading}/>
           </label>
         </div>
         <details style={{marginTop:14}}>
@@ -172,7 +172,7 @@ export default function Settings() {
           </button>
           <label className="btn-outline" style={{flex:1,cursor:"pointer",textAlign:"center"}}>
             {importing?"⏳ Importing...":"⬆ Import Data"}
-            <input type="file" accept=".json" style={{display:"none"}} onChange={handleImport} disabled={importing}/>
+            <input type="file" accept=".json,application/json" style={{display:"none"}} onChange={handleImport} disabled={importing}/>
           </label>
         </div>
         <p className="muted" style={{fontSize:11,marginTop:10}}>Export = one JSON with your profiles, App IDs/Secrets, pages, schedules &amp; Drive key. Keep it private (it contains access tokens).</p>
