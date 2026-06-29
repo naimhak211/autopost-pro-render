@@ -988,8 +988,9 @@ def upload_user_drive_key():
         j = json.loads(content)
         if "client_email" not in j:
             return jsonify({"success": False, "error": "Valid Service Account JSON নয়"}), 400
-        get_db().execute("UPDATE users SET drive_key_json=? WHERE id=?", (content, uid()))
-        get_db().commit()
+        db = get_db()
+        db.execute("UPDATE users SET drive_key_json=? WHERE id=?", (content, uid()))
+        db.commit()
         return jsonify({"success": True, "email": j["client_email"]})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 400
