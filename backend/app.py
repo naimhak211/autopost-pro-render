@@ -8,7 +8,8 @@ from werkzeug.utils import secure_filename
 from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
 from zoneinfo import ZoneInfo
-import os, json, requests, sqlite3, logging, time, urllib.parse
+import os, json, requests, logging, time, urllib.parse
+from db_postgres import get_db
 
 from google_auth import verify_google_token
 from notifications import register_notification_routes
@@ -25,7 +26,6 @@ app = Flask(__name__)
 CORS(app)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
-DB = "autopost.db"
 scheduler = BackgroundScheduler(timezone="Asia/Dhaka")
 scheduler.start()
 
@@ -39,11 +39,6 @@ TOKEN_MAX_AGE = 7 * 24 * 3600
 # ════════════════════════════════════════════════
 # DATABASE
 # ════════════════════════════════════════════════
-def get_db():
-    conn = sqlite3.connect(DB)
-    conn.row_factory = sqlite3.Row
-    return conn
-
 def init_db():
     db = get_db()
     db.executescript("""
@@ -167,7 +162,7 @@ def init_db():
             "INSERT INTO users (username, password_hash, role) VALUES (?,?,?)",
             (admin_u, generate_password_hash(admin_p), "admin")
         )
-    db.execute("INSERT OR IGNORE INTO settings (key,value) VALUES ('credits','0')")
+    db.execute("INSERT INTO settings (key,value) VALUES ('credits','0') ON CONFLICT (key) DO NOTHING")
     db.commit()
 
 init_db()
@@ -1050,7 +1045,7 @@ def save_settings():
     db = get_db()
     for k, v in (request.json or {}).items():
         if k in ("admin_password", "admin_username"): continue
-        db.execute("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)", (k, v))
+        db.execute("INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (k, v))
     db.commit()
     return jsonify({"success": True})
 
@@ -1059,7 +1054,7 @@ def save_settings():
 def toggle_auto_sync():
     enabled = (request.json or {}).get("enabled", False)
     db = get_db()
-    db.execute("INSERT OR REPLACE INTO settings (key,value) VALUES ('auto_sync',?)", ("1" if enabled else "0",))
+    db.execute("INSERT INTO settings (key,value) VALUES ('auto_sync',?) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", ("1" if enabled else "0",))
     db.commit()
     if enabled:
         try: scheduler.add_job(_sync_all_accounts, "interval", hours=6, id="account_sync", replace_existing=True)
@@ -1094,7 +1089,7 @@ def upload_drive_key():
         if "client_email" not in j:
             return jsonify({"success": False, "error": "Valid Service Account JSON নয়"}), 400
         db = get_db()
-        db.execute("INSERT OR REPLACE INTO settings (key,value) VALUES ('google_service_account',?)", (content,))
+        db.execute("INSERT INTO settings (key,value) VALUES ('google_service_account',?) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (content,))
         db.commit()
         return jsonify({"success": True, "email": j["client_email"]})
     except Exception as e:
@@ -1208,16 +1203,16 @@ def backup_import():
     db = get_db()
     try:
         for u in d.get("users", []):
-            db.execute("INSERT OR IGNORE INTO users (id,username,password_hash,email,role,credits,is_active) VALUES (?,?,?,?,?,?,?)",
+            db.execute("INSERT INTO users (id,username,password_hash,email,role,credits,is_active) VALUES (?,?,?,?,?,?,?) ON CONFLICT (id) DO NOTHING",
                        (u.get("id"), u.get("username"), u.get("password_hash",""), u.get("email",""), u.get("role","user"), u.get("credits",0), u.get("is_active",1)))
         for a in d.get("accounts", []):
-            db.execute("INSERT OR REPLACE INTO accounts (id,user_id,platform,name,type,token,page_id,ig_user_id,status) VALUES (?,?,?,?,?,?,?,?,?)",
+            db.execute("INSERT INTO accounts (id,user_id,platform,name,type,token,page_id,ig_user_id,status) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT (id) DO UPDATE SET user_id=EXCLUDED.user_id, platform=EXCLUDED.platform, name=EXCLUDED.name, type=EXCLUDED.type, token=EXCLUDED.token, page_id=EXCLUDED.page_id, ig_user_id=EXCLUDED.ig_user_id, status=EXCLUDED.status",
                        (a.get("id"),a.get("user_id"),a.get("platform"),a.get("name"),a.get("type"),a.get("token"),a.get("page_id"),a.get("ig_user_id"),a.get("status","connected")))
         for w in d.get("workflows", []):
-            db.execute("INSERT OR REPLACE INTO workflows (id,user_id,account_id,source_type,source_value,success_folder_id,videos_per_run,active,repeat_mode,days_of_week,timezone,times,status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            db.execute("INSERT INTO workflows (id,user_id,account_id,source_type,source_value,success_folder_id,videos_per_run,active,repeat_mode,days_of_week,timezone,times,status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT (id) DO UPDATE SET user_id=EXCLUDED.user_id, account_id=EXCLUDED.account_id, source_type=EXCLUDED.source_type, source_value=EXCLUDED.source_value, success_folder_id=EXCLUDED.success_folder_id, videos_per_run=EXCLUDED.videos_per_run, active=EXCLUDED.active, repeat_mode=EXCLUDED.repeat_mode, days_of_week=EXCLUDED.days_of_week, timezone=EXCLUDED.timezone, times=EXCLUDED.times, status=EXCLUDED.status",
                        (w.get("id"),w.get("user_id"),w.get("account_id"),w.get("source_type"),w.get("source_value"),w.get("success_folder_id"),w.get("videos_per_run",1),w.get("active",1),w.get("repeat_mode","everyday"),w.get("days_of_week","[]"),w.get("timezone","Asia/Dhaka"),w.get("times","[]"),w.get("status","not_configured")))
         for k,v in d.get("settings",{}).items():
-            db.execute("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)", (k,v))
+            db.execute("INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (k,v))
         db.commit()
         return jsonify({"success": True})
     except Exception as e:
