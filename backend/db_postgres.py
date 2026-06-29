@@ -3,6 +3,7 @@ DATABASE_URL = os.getenv("DATABASE_URL","")
 
 def get_db():
     conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
+    conn.autocommit = False
     return PgConn(conn)
 
 class PgRow(dict):
@@ -17,12 +18,18 @@ class PgCursor:
     def __init__(self,cursor,conn):
         self._cur=cursor; self._conn=conn; self.lastrowid=None; self.rowcount=0
     def execute(self,sql,params=()):
-        pg_sql=sql.replace("?","%s").replace("INTEGER PRIMARY KEY AUTOINCREMENT","SERIAL PRIMARY KEY").replace("TEXT DEFAULT CURRENT_TIMESTAMP","TIMESTAMP DEFAULT NOW()")
-        self._cur.execute(pg_sql,params); self.rowcount=self._cur.rowcount
         try:
-            if sql.strip().upper().startswith("INSERT"):
-                self._cur.execute("SELECT lastval()"); self.lastrowid=self._cur.fetchone()[0]
-        except: pass
+            pg_sql=sql.replace("?","%s").replace("INTEGER PRIMARY KEY AUTOINCREMENT","SERIAL PRIMARY KEY").replace("TEXT DEFAULT CURRENT_TIMESTAMP","TIMESTAMP DEFAULT NOW()")
+            self._cur.execute(pg_sql,params)
+            self.rowcount=self._cur.rowcount
+            try:
+                if sql.strip().upper().startswith("INSERT"):
+                    self._cur.execute("SELECT lastval()")
+                    self.lastrowid=self._cur.fetchone()[0]
+            except: pass
+        except Exception as e:
+            self._conn.rollback()
+            raise e
         return self
     def fetchone(self):
         row=self._cur.fetchone(); return PgRow(row) if row else None
@@ -36,26 +43,18 @@ class PgConn:
     def execute(self,sql,params=()):
         return PgCursor(self._cur,self._conn).execute(sql,params)
     def executescript(self,sql):
-        import re
-        # Split on semicolons but not inside parentheses
-        statements = []
-        depth = 0
-        current = ""
+        depth=0; current=""; statements=[]
         for char in sql:
-            if char == '(': depth += 1
-            elif char == ')': depth -= 1
-            if char == ';' and depth == 0:
-                if current.strip():
-                    statements.append(current.strip())
-                current = ""
-            else:
-                current += char
-        if current.strip():
-            statements.append(current.strip())
-        cur = PgCursor(self._cur, self._conn)
+            if char=='(': depth+=1
+            elif char==')': depth-=1
+            if char==';' and depth==0:
+                if current.strip(): statements.append(current.strip())
+                current=""
+            else: current+=char
+        if current.strip(): statements.append(current.strip())
+        cur=PgCursor(self._cur,self._conn)
         for stmt in statements:
-            if stmt:
-                cur.execute(stmt)
+            if stmt: cur.execute(stmt)
         return cur
     def commit(self): self._conn.commit()
     def close(self): self._conn.close()
