@@ -1046,7 +1046,11 @@ def save_settings():
     db = get_db()
     for k, v in (request.json or {}).items():
         if k in ("admin_password", "admin_username"): continue
-        db.execute("INSERT INTO settings (key,value) VALUES (?,?) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", (k, v))
+        existing = db.execute("SELECT key FROM settings WHERE key=?", (k,)).fetchone()
+        if existing:
+            db.execute("UPDATE settings SET value=? WHERE key=?", (v, k))
+        else:
+            db.execute("INSERT INTO settings (key,value) VALUES (?,?)", (k, v))
     db.commit()
     return jsonify({"success": True})
 
