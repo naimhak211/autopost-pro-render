@@ -19,6 +19,7 @@ const STATUS_META = {
 const EMPTY = {
   id: null, account_id: "", source_type: "drive", source_value: "", success_folder_id: "",
   videos_per_run: 1, active: true, repeat_mode: "everyday", days_of_week: [], timezone: "Asia/Dhaka", times: ["10:00"],
+  custom_caption: "", use_ai_title: false,
 };
 
 export default function Workflows() {
@@ -43,6 +44,7 @@ export default function Workflows() {
   useEffect(load, []);
 
   const up = (k, v) => setForm(f => ({ ...f, [k]: v }));
+  const up_both = (patch) => setForm(f => ({ ...f, ...patch }));
 
   const openNew = () => { setForm({ ...EMPTY, account_id: accounts[0]?.id || "" }); setShowModal(true); };
   const openEdit = (w) => {
@@ -50,6 +52,7 @@ export default function Workflows() {
       id: w.id, account_id: w.account_id, source_type: w.source_type, source_value: w.source_value,
       success_folder_id: w.success_folder_id || "", videos_per_run: w.videos_per_run, active: w.active,
       repeat_mode: w.repeat_mode, days_of_week: w.days_of_week, timezone: w.timezone, times: w.times.length ? w.times : ["10:00"],
+      custom_caption: w.custom_caption || "", use_ai_title: !!w.use_ai_title,
     });
     setShowModal(true);
   };
@@ -66,7 +69,7 @@ export default function Workflows() {
     if (!form.source_value.trim()) return alert("Source value (Drive folder link বা TikTok profile URL) দিন");
     setSaving(true);
     try {
-      await saveWorkflow(form);
+      await saveWorkflow({ ...form, custom_caption: (form.custom_caption || "").trim() });
       setShowModal(false);
       load();
     } catch { alert("Save ব্যর্থ হয়েছে"); }
@@ -87,10 +90,11 @@ export default function Workflows() {
   const handleRunNow = async (id) => {
     setRunningId(id);
     try {
-      await runWorkflowNow(id);
-      alert("✅ Workflow রান করা হয়েছে");
+      const res = await runWorkflowNow(id);
+      if (res.success) alert("✅ Workflow রান করা হয়েছে");
+      else alert("⚠️ " + (res.error || "রান ব্যর্থ হয়েছে — ভিডিও পাওয়া যায়নি"));
       load();
-    } catch { alert("❌ রান ব্যর্থ হয়েছে"); }
+    } catch { alert("❌ রান ব্যর্থ হয়েছে — সার্ভারে সংযোগ করা যায়নি"); }
     setRunningId(null);
   };
 
@@ -177,6 +181,11 @@ export default function Workflows() {
                   <span className="muted" style={{ fontSize: 11, marginLeft: 6 }}>({w.account_platform})</span>
                 </div>
                 <div className="queue-caption" style={{ fontSize: 12 }}>{w.source_value}</div>
+                {w.last_error && (
+                  <div style={{ fontSize: 11, color: "var(--danger)", marginTop: 2 }}>
+                    ⚠️ {w.last_error}
+                  </div>
+                )}
                 <div className="queue-time">
                   ⏰ {w.times.map(fmt).join(", ")} · {w.timezone} · {w.repeat_mode === "everyday" ? "প্রতিদিন" : w.days_of_week.join(",")}
                   {" · "}{w.videos_per_run}টা/রান
@@ -226,8 +235,12 @@ export default function Workflows() {
             {form.source_type === "drive" ? (
               <>
                 <label>Google Drive Folder ID/Link</label>
-                <input placeholder="Folder ID অথবা পুরো লিংক" value={form.source_value} onChange={e => up("source_value", e.target.value)} />
-                <p className="muted" style={{ fontSize: 11 }}>✨ ভিডিও পুরাতন→নতুন ক্রমে পোস্ট হবে, তারপর 'success' সাবফোল্ডারে সরানো হবে। শিরোনাম আসবে ফাইলের নাম থেকে।</p>
+                <input placeholder="Folder ID অথবা পুরো ফোল্ডার লিংক" value={form.source_value} onChange={e => up("source_value", e.target.value)} />
+                <p className="tip-box" style={{ fontSize: 11, marginTop: 6 }}>
+                  ✅ ফোল্ডার লিংক দিন (যেমন: <code>drive.google.com/drive/folders/ABC...</code>) — একটা ফোল্ডারে অনেকগুলো ভিডিও থাকবে।<br/>
+                  ❌ একটা single ফাইলের লিংক (<code>/file/d/...</code>) দেবেন না — সিস্টেম স্বয়ংক্রিয়ভাবে সেই ফাইলের parent folder খুঁজে নেয়ার চেষ্টা করবে, কিন্তু সবসময় কাজ করবে না।
+                </p>
+                <p className="muted" style={{ fontSize: 11 }}>✨ ভিডিও পুরাতন→নতুন ক্রমে পোস্ট হবে, তারপর 'success' সাবফোল্ডারে সরানো হবে।</p>
                 <label>Success ফোল্ডার ID (optional)</label>
                 <input placeholder="পোস্ট হওয়ার পর ভিডিও এখানে সরবে" value={form.success_folder_id} onChange={e => up("success_folder_id", e.target.value)} />
               </>
@@ -238,6 +251,29 @@ export default function Workflows() {
                 <p className="muted" style={{ fontSize: 11 }}>🎬 ভিডিও পুরাতন→নতুন ক্রমে ডাউনলোড ও পোস্ট হবে, একবার পোস্ট হলে আর রিপোস্ট হবে না। নতুন ভিডিও শেষ হলে workflow auto-pause হবে।</p>
                 <p className="tip-box" style={{ fontSize: 11 }}>⚠️ শুধু নিজের বা অনুমতি থাকা প্রোফাইল ব্যবহার করুন — অন্যের কনটেন্ট রিপোস্ট করলে পেজ demote হতে পারে।</p>
               </>
+            )}
+
+            <label style={{ marginTop: 14 }}>✏️ Caption / Title</label>
+            <div className="platform-picker" style={{ marginBottom: 8 }}>
+              <button className={`plat-pick-btn ${!form.custom_caption && !form.use_ai_title ? "selected" : ""}`}
+                onClick={() => up_both({ custom_caption: "", use_ai_title: false })}>📄 ফাইলের নাম</button>
+              <button className={`plat-pick-btn ${form.use_ai_title ? "selected" : ""}`}
+                onClick={() => up_both({ use_ai_title: true, custom_caption: "" })}>🤖 AI SEO Title</button>
+              <button className={`plat-pick-btn ${form.custom_caption ? "selected" : ""}`}
+                onClick={() => up_both({ use_ai_title: false, custom_caption: form.custom_caption || " " })}>✍️ Manual Caption</button>
+            </div>
+            {!!form.custom_caption && (
+              <>
+                <textarea rows={2} placeholder="সব ভিডিওতে এই caption/title ব্যবহার হবে..."
+                  value={form.custom_caption} onChange={e => up("custom_caption", e.target.value)} />
+                <p className="muted" style={{ fontSize: 11 }}>প্রতিটা পোস্টে এই একই caption যাবে — Drive ফাইলের নাম ব্যবহার হবে না।</p>
+              </>
+            )}
+            {form.use_ai_title && (
+              <p className="muted" style={{ fontSize: 11 }}>🤖 প্রতিটা ভিডিওর জন্য AI ফাইলের নাম থেকে নতুন SEO-friendly title বানাবে।</p>
+            )}
+            {!form.custom_caption && !form.use_ai_title && (
+              <p className="muted" style={{ fontSize: 11 }}>ডিফল্ট — Drive ফাইলের নাম (বা TikTok-এর title) সরাসরি caption হিসেবে ব্যবহার হবে।</p>
             )}
 
             <label>⚙️ প্রতি রানে কয়টা ভিডিও</label>

@@ -93,7 +93,7 @@ export default function UserProfile() {
           {driveStatus?.email&&<span className="muted" style={{fontSize:12}}>{driveStatus.email}</span>}
           <label className="btn-outline sm" style={{cursor:"pointer",marginLeft:"auto"}}>
             {uploading?"⏳ Uploading...":"⬆ Upload JSON"}
-            <input type="file" accept=".json,application/json" style={{display:"none"}} onChange={handleDriveUpload} disabled={uploading}/>
+            <input type="file" accept="*/*" style={{display:"none"}} onChange={handleDriveUpload} disabled={uploading}/>
           </label>
         </div>
 

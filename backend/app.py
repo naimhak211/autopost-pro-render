@@ -9,7 +9,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
 from zoneinfo import ZoneInfo
 import os, json, requests, logging, time, urllib.parse
-from db_postgres import get_db
+from db_postgres import get_db, release_db_connection
 
 from google_auth import verify_google_token
 from notifications import register_notification_routes
@@ -28,6 +28,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(mess
 
 scheduler = BackgroundScheduler(timezone="Asia/Dhaka")
 scheduler.start()
+
+@app.teardown_appcontext
+def _close_db_connection(exception=None):
+    """প্রতিটা request শেষে DB connection pool-এ ফেরত দেওয়া হয় — connection leak ঠেকানোর জন্য।"""
+    release_db_connection()
 
 UPLOAD_DIR = os.path.join(app.static_folder or "static", "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -121,6 +126,9 @@ def init_db():
         times TEXT DEFAULT '[]',
         last_run_marker TEXT,
         status TEXT DEFAULT 'not_configured',
+        last_error TEXT,
+        custom_caption TEXT,
+        use_ai_title INTEGER DEFAULT 0,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
     CREATE TABLE IF NOT EXISTS workflow_posted_items (
@@ -163,7 +171,18 @@ def init_db():
             (admin_u, generate_password_hash(admin_p), "admin")
         )
     db.execute("INSERT INTO settings (key,value) VALUES ('credits','0') ON CONFLICT (key) DO NOTHING")
+    # ── Migration: পুরনো deployment-এ workflows টেবিলে নতুন কলাম যুক্ত করা ──
+    for coldef in [
+        "last_error TEXT",
+        "custom_caption TEXT",
+        "use_ai_title INTEGER DEFAULT 0",
+    ]:
+        try:
+            db.execute(f"ALTER TABLE workflows ADD COLUMN IF NOT EXISTS {coldef}")
+        except Exception as e:
+            logging.warning(f"Migration skip ({coldef}): {e}")
     db.commit()
+    db.close()
 
 init_db()
 
@@ -242,6 +261,10 @@ DOW_MAP = {0:"MO",1:"TU",2:"WE",3:"TH",4:"FR",5:"SA",6:"SU"}
 # ACCOUNT SYNC & WORKFLOW ENGINE
 # ════════════════════════════════════════════════
 def _sync_all_accounts():
+    with app.app_context():
+        return _sync_all_accounts_impl()
+
+def _sync_all_accounts_impl():
     db = get_db()
     accs = db.execute("SELECT * FROM accounts WHERE platform='Facebook'").fetchall()
     synced = 0
@@ -286,6 +309,11 @@ def execute_workflow(workflow_id):
     user = db.execute("SELECT * FROM users WHERE id=?", (w["user_id"],)).fetchone()
     if not user: return
 
+    def _fail(msg):
+        db.execute("UPDATE workflows SET active=0, status='not_configured', last_error=? WHERE id=?", (msg, workflow_id))
+        db.commit()
+        send_telegram(f"⚠️ Workflow #{workflow_id} ({acc['name']}): {msg}")
+
     n = w["videos_per_run"] or 1
     posted_ids = {r["source_item_id"] for r in db.execute(
         "SELECT source_item_id FROM workflow_posted_items WHERE workflow_id=?", (workflow_id,)
@@ -293,13 +321,17 @@ def execute_workflow(workflow_id):
 
     candidates = []
     if w["source_type"] == "drive":
+        if not user.get("drive_key_json"):
+            _fail("Google Drive key configure করা হয়নি — My Profile → Drive Key upload করুন")
+            return
         try:
             files = list_videos(w["source_value"], user_drive_json=user["drive_key_json"])
-            files = list(reversed(files))
-            candidates = [f for f in files if f["id"] not in posted_ids][:n]
         except Exception as e:
             logging.error(f"Drive list error for workflow {workflow_id}: {e}")
+            _fail(f"Drive ফোল্ডার পড়তে ব্যর্থ: {e}")
             return
+        files = list(reversed(files))
+        candidates = [f for f in files if f["id"] not in posted_ids][:n]
     elif w["source_type"] == "tiktok":
         username = w["source_value"].rstrip("/").split("@")[-1].split("/")[0]
         videos = scrape_tiktok_profile(username, limit=30)
@@ -307,32 +339,52 @@ def execute_workflow(workflow_id):
         candidates = [v for v in videos if v["id"] not in posted_ids][:n]
 
     if not candidates:
-        db.execute("UPDATE workflows SET active=0, status='not_configured' WHERE id=?", (workflow_id,))
-        db.commit()
-        send_telegram(f"⚠️ Workflow #{workflow_id} ({acc['name']}): ভিডিও শেষ, auto-paused")
+        if w["source_type"] == "drive":
+            _fail("নতুন ভিডিও পাওয়া যায়নি — ফোল্ডারে video নেই, অথবা সব আগেই পোস্ট হয়ে গেছে। (নোট: এখানে Folder link দিতে হবে, একটা single file link নয়)")
+        else:
+            _fail("নতুন ভিডিও পাওয়া যায়নি — সব আগেই পোস্ট হয়ে গেছে")
         return
+
+    custom_caption = (w.get("custom_caption") or "").strip()
+    use_ai_title = bool(w.get("use_ai_title"))
 
     for item in candidates:
         if w["source_type"] == "drive":
             video_url = item.get("webContentLink") or get_public_url(item["id"])
-            title = os.path.splitext(item["name"])[0]
+            filename_title = os.path.splitext(item["name"])[0]
+        else:
+            filename_title = (item.get("title") or "Video")[:80]
+
+        # ── Title/caption priority: custom_caption > AI SEO title > filename ──
+        if custom_caption:
+            title = custom_caption
+        elif use_ai_title:
+            seo = generate_seo(filename_title, platform="Facebook")
+            title = seo["seo_title"] if seo and seo.get("seo_title") else filename_title
+        else:
+            title = filename_title
+
+        if w["source_type"] == "drive":
             ok, msg = facebook_post_video(acc["token"], acc["page_id"], title, video_url)
             _record_workflow_post(db, w, acc, item["id"], title, ok, msg)
             if ok and w["success_folder_id"]:
                 move_to_success(item["id"], w["success_folder_id"], user_drive_json=user["drive_key_json"])
         else:
             dl_ok, path = download_tiktok(item["url"])
-            title = (item.get("title") or "Video")[:80]
             if not dl_ok:
                 _record_workflow_post(db, w, acc, item["id"], title, False, f"Download failed: {path}")
                 continue
             ok, msg = facebook_post_video_file(acc["token"], acc["page_id"], title, path)
             _record_workflow_post(db, w, acc, item["id"], title, ok, msg)
 
-    db.execute("UPDATE workflows SET status='active' WHERE id=?", (workflow_id,))
+    db.execute("UPDATE workflows SET status='active', last_error=NULL WHERE id=?", (workflow_id,))
     db.commit()
 
 def run_workflow_engine():
+    with app.app_context():
+        _run_workflow_engine_impl()
+
+def _run_workflow_engine_impl():
     db = get_db()
     rows = db.execute("SELECT * FROM workflows WHERE active=1").fetchall()
     for w in rows:
@@ -363,6 +415,10 @@ scheduler.add_job(_sync_all_accounts, "interval", hours=6, id="account_sync", re
 # SCHEDULE JOB RUNNER
 # ════════════════════════════════════════════════
 def run_post_job(schedule_id):
+    with app.app_context():
+        _run_post_job_impl(schedule_id)
+
+def _run_post_job_impl(schedule_id):
     db = get_db()
     row = db.execute("SELECT * FROM schedules WHERE id=?", (schedule_id,)).fetchone()
     if not row: return
@@ -868,6 +924,8 @@ def _serialize_workflow(r):
     d["days_of_week"] = json.loads(d["days_of_week"] or "[]")
     d["times"] = json.loads(d["times"] or "[]")
     d["active"] = bool(d["active"])
+    d["use_ai_title"] = bool(d.get("use_ai_title"))
+    d["custom_caption"] = d.get("custom_caption") or ""
     return d
 
 @app.route("/api/workflows", methods=["GET"])
@@ -897,15 +955,18 @@ def save_workflow():
         int(d.get("videos_per_run",1)), active, d.get("repeat_mode","everyday"),
         json.dumps(d.get("days_of_week",[])), d.get("timezone","Asia/Dhaka"),
         json.dumps(d.get("times",[])), status,
+        d.get("custom_caption",""), 1 if d.get("use_ai_title") else 0,
     )
     if d.get("id"):
         db.execute("""UPDATE workflows SET user_id=?,account_id=?,source_type=?,source_value=?,success_folder_id=?,
-                       videos_per_run=?,active=?,repeat_mode=?,days_of_week=?,timezone=?,times=?,status=? WHERE id=? AND user_id=?""",
+                       videos_per_run=?,active=?,repeat_mode=?,days_of_week=?,timezone=?,times=?,status=?,
+                       custom_caption=?,use_ai_title=?,last_error=NULL WHERE id=? AND user_id=?""",
                    args + (d["id"], uid()))
         wid = d["id"]
     else:
         cur = db.execute("""INSERT INTO workflows (user_id,account_id,source_type,source_value,success_folder_id,
-                             videos_per_run,active,repeat_mode,days_of_week,timezone,times,status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", args)
+                             videos_per_run,active,repeat_mode,days_of_week,timezone,times,status,
+                             custom_caption,use_ai_title) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", args)
         wid = cur.lastrowid
     db.commit()
     return jsonify({"success": True, "id": wid})
@@ -926,7 +987,10 @@ def toggle_workflow(wid):
     w = db.execute("SELECT active FROM workflows WHERE id=? AND user_id=?", (wid, uid())).fetchone()
     if not w: return jsonify({"success": False}), 404
     new_active = 0 if w["active"] else 1
-    db.execute("UPDATE workflows SET active=?, status=? WHERE id=?", (new_active, "active" if new_active else "paused", wid))
+    if new_active:
+        db.execute("UPDATE workflows SET active=1, status='active', last_error=NULL WHERE id=?", (wid,))
+    else:
+        db.execute("UPDATE workflows SET active=0, status='paused' WHERE id=?", (wid,))
     db.commit()
     return jsonify({"success": True, "active": bool(new_active)})
 
@@ -936,8 +1000,14 @@ def run_workflow_now(wid):
     # Verify ownership
     w = get_db().execute("SELECT id FROM workflows WHERE id=? AND user_id=?", (wid, uid())).fetchone()
     if not w: return jsonify({"success": False, "error": "Not found"}), 404
-    try: execute_workflow(wid); return jsonify({"success": True})
-    except Exception as e: return jsonify({"success": False, "error": str(e)}), 500
+    try:
+        execute_workflow(wid)
+        after = get_db().execute("SELECT status, last_error FROM workflows WHERE id=?", (wid,)).fetchone()
+        if after and after["status"] == "not_configured" and after["last_error"]:
+            return jsonify({"success": False, "error": after["last_error"]})
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route("/api/workflows/bulk-toggle", methods=["POST"])
 @auth_required

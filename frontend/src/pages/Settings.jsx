@@ -35,7 +35,7 @@ export default function Settings() {
 
   const save = async () => {
     try { await saveSettings(form); setSaved(true); setTimeout(()=>setSaved(false),2500); }
-    catch { alert("সেভ ব্যর্থ"); }
+    catch(e) { alert("সেভ ব্যর্থ: " + (e?.message || JSON.stringify(e))); }
   };
 
   const testConn = async () => {
