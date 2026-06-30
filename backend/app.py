@@ -78,7 +78,7 @@ TOKEN_MAX_AGE = 7 * 24 * 3600
 # DATABASE
 # ════════════════════════════════════════════════
 def init_db():
-    db = get_db()
+    db = _db_postgres.get_db()
     db.executescript("""
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -202,6 +202,7 @@ def init_db():
         )
     db.execute("INSERT INTO settings (key,value) VALUES ('credits','0') ON CONFLICT (key) DO NOTHING")
     db.commit()
+    db.close()
 
 init_db()
 
