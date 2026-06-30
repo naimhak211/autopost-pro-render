@@ -19,14 +19,7 @@ async function req(path, opts = {}) {
     setToken(''); setUserInfo(null)
     window.dispatchEvent(new Event('autopost-unauthorized'))
   }
-  if (!res.ok) {
-    let detail = `API error: ${res.status}`
-    try {
-      const body = await res.json()
-      detail = body?.error || body?.message || detail
-    } catch {}
-    throw new Error(detail)
-  }
+  if (!res.ok) throw new Error(`API error: ${res.status}`)
   return res.json()
 }
 

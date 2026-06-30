@@ -1092,6 +1092,10 @@ def save_settings():
         try:
             db = get_db()
             db.rollback()  # clear any leftover aborted-transaction state before we start
+            try:
+                logging.info(f"[settings-debug] attempt={attempt} backend_pid={db._conn.get_backend_pid()} tx_status_after_rollback={db._conn.get_transaction_status()}")
+            except Exception:
+                pass
             for k, v in incoming.items():
                 if k in ("admin_password", "admin_username"):
                     continue
