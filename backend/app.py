@@ -222,7 +222,9 @@ def auth_required(f):
             return jsonify({"success": False, "error": "Session মেয়াদ শেষ"}), 401
         except BadSignature:
             return jsonify({"success": False, "error": "অবৈধ session"}), 401
-        user = get_db().execute("SELECT * FROM users WHERE id=? AND is_active=1", (payload["uid"],)).fetchone()
+        db = get_db()
+        db.rollback()
+        user = db.execute("SELECT * FROM users WHERE id=? AND is_active=1", (payload["uid"],)).fetchone()
         if not user:
             return jsonify({"success": False, "error": "User পাওয়া যায়নি"}), 401
         request.current_user = dict(user)
@@ -240,7 +242,9 @@ def admin_required(f):
             payload = serializer.loads(token, max_age=TOKEN_MAX_AGE)
         except (SignatureExpired, BadSignature):
             return jsonify({"success": False, "error": "অবৈধ session"}), 401
-        user = get_db().execute("SELECT * FROM users WHERE id=? AND is_active=1", (payload["uid"],)).fetchone()
+        db = get_db()
+        db.rollback()
+        user = db.execute("SELECT * FROM users WHERE id=? AND is_active=1", (payload["uid"],)).fetchone()
         if not user or user["role"] != "admin":
             return jsonify({"success": False, "error": "Admin access প্রয়োজন"}), 403
         request.current_user = dict(user)
@@ -1082,28 +1086,36 @@ def get_settings_route():
 @app.route("/api/settings", methods=["POST"])
 @admin_required
 def save_settings():
-    try:
-        db = get_db()
-        incoming = request.json or {}
-        for k, v in incoming.items():
-            if k in ("admin_password", "admin_username"):
-                continue
-            if v is None:
-                v = ""
-            elif isinstance(v, bool):
-                v = "1" if v else "0"
-            elif not isinstance(v, str):
-                v = str(v)
-            row = db.execute("SELECT key FROM settings WHERE key=?", (k,)).fetchone()
-            if row:
-                db.execute("UPDATE settings SET value=? WHERE key=?", (v, k))
-            else:
-                db.execute("INSERT INTO settings (key,value) VALUES (?,?)", (k, v))
-        db.commit()
-        return jsonify({"success": True})
-    except Exception as e:
-        logging.exception("save_settings failed")
-        return jsonify({"success": False, "error": str(e)}), 400
+    incoming = request.json or {}
+    last_err = None
+    for attempt in range(2):
+        try:
+            db = get_db()
+            db.rollback()  # clear any leftover aborted-transaction state before we start
+            for k, v in incoming.items():
+                if k in ("admin_password", "admin_username"):
+                    continue
+                if v is None:
+                    v = ""
+                elif isinstance(v, bool):
+                    v = "1" if v else "0"
+                elif not isinstance(v, str):
+                    v = str(v)
+                row = db.execute("SELECT key FROM settings WHERE key=?", (k,)).fetchone()
+                if row:
+                    db.execute("UPDATE settings SET value=? WHERE key=?", (v, k))
+                else:
+                    db.execute("INSERT INTO settings (key,value) VALUES (?,?)", (k, v))
+            db.commit()
+            return jsonify({"success": True})
+        except Exception as e:
+            last_err = e
+            logging.exception(f"save_settings failed (attempt {attempt+1})")
+            try:
+                get_db().rollback()
+            except Exception:
+                pass
+    return jsonify({"success": False, "error": str(last_err)}), 400
 
 @app.route("/api/settings/auto-sync", methods=["POST"])
 @admin_required
