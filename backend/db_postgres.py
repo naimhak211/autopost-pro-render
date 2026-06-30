@@ -1,147 +1,116 @@
 import os, psycopg2, psycopg2.extras
-from psycopg2 import pool as pg_pool
-
-try:
-    from flask import g, has_app_context
-except Exception:  # pragma: no cover - db_postgres might be imported outside Flask in scripts
-    g = None
-    def has_app_context(): return False
+from psycopg2.pool import ThreadedConnectionPool
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
-# ── Connection Pool ──────────────────────────────────────────────────────────
-# আগে প্রতিটা get_db() কল আলাদা psycopg2.connect() করত আর কখনো close() হতো না।
-# একটা route-এ গড়ে ২-৩ বার get_db() কল হতো, তাই অনেক connection জমে গিয়ে
-# Render/Supabase free-tier limit ছুঁয়ে এলোমেলোভাবে "API error: 500" আসত
-# (Settings save, Workflow status update ইত্যাদি কাজে)।
-# এখন: (১) একটা ছোট connection pool থাকে, (২) একই Flask request-এর ভেতরে
-# একাধিকবার get_db() কল হলেও একই connection reuse হয় (flask.g তে cache করা),
-# (৩) request শেষে app.py-র teardown_appcontext এই connection pool-এ ফেরত দেয়।
+# A small connection pool so we don't open a brand-new TCP/SSL connection on
+# every single get_db() call (this was exhausting Render's free Postgres
+# connection limit and causing random "SSL error: bad record mac" /
+# "connection already closed" failures).
 _pool = None
 
 def _get_pool():
     global _pool
     if _pool is None:
-        _pool = pg_pool.ThreadedConnectionPool(1, 10, DATABASE_URL)
+        _pool = ThreadedConnectionPool(
+            minconn=1,
+            maxconn=int(os.getenv("DB_POOL_MAX", "8")),
+            dsn=DATABASE_URL,
+            cursor_factory=psycopg2.extras.RealDictCursor,
+        )
     return _pool
 
-
 def get_db():
-    if has_app_context() and g is not None:
-        if "db_conn" not in g:
-            raw = _get_pool().getconn()
-            raw.autocommit = False
-            g.db_conn = PgConn(raw)
-        return g.db_conn
-    # Flask app context ছাড়া (e.g. স্ক্রিপ্ট থেকে) কল হলে fallback — caller-কে .close() করতে হবে
-    raw = _get_pool().getconn()
-    raw.autocommit = False
-    return PgConn(raw)
-
-
-def release_db_connection():
-    """app.py-র teardown_appcontext থেকে কল হয় — request শেষে connection pool-এ ফেরত দেয়।"""
-    if has_app_context() and g is not None and "db_conn" in g:
-        g.db_conn.close()
-        del g.db_conn
-
+    pool = _get_pool()
+    conn = pool.getconn()
+    # If a previous user of this connection left it in a broken/aborted
+    # state, reset it instead of poisoning every future query.
+    try:
+        if conn.closed:
+            pool.putconn(conn, close=True)
+            conn = pool.getconn()
+        else:
+            conn.rollback()
+    except Exception:
+        try:
+            pool.putconn(conn, close=True)
+        except Exception:
+            pass
+        conn = pool.getconn()
+    conn.autocommit = False
+    return PgConn(conn, pool)
 
 class PgRow(dict):
-    def __getitem__(self, key):
-        if isinstance(key, int):
-            return list(self.values())[key]
+    def __getitem__(self,key):
+        if isinstance(key,int): return list(self.values())[key]
         return super().__getitem__(key)
-
-    def __getattr__(self, key):
-        try:
-            return self[key]
-        except KeyError:
-            raise AttributeError(key)
-
+    def __getattr__(self,key):
+        try: return self[key]
+        except KeyError: raise AttributeError(key)
 
 class PgCursor:
-    def __init__(self, cursor, conn):
-        self._cur = cursor
-        self._conn = conn
-        self.lastrowid = None
-        self.rowcount = 0
-
-    def execute(self, sql, params=()):
+    def __init__(self,cursor,conn):
+        self._cur=cursor; self._conn=conn; self.lastrowid=None; self.rowcount=0
+    def execute(self,sql,params=()):
         try:
-            pg_sql = (
-                sql.replace("?", "%s")
-                .replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
-                .replace("TEXT DEFAULT CURRENT_TIMESTAMP", "TIMESTAMP DEFAULT NOW()")
-            )
-            self._cur.execute(pg_sql, params)
-            self.rowcount = self._cur.rowcount
+            pg_sql=sql.replace("?","%s").replace("INTEGER PRIMARY KEY AUTOINCREMENT","SERIAL PRIMARY KEY").replace("TEXT DEFAULT CURRENT_TIMESTAMP","TIMESTAMP DEFAULT NOW()")
+            self._cur.execute(pg_sql,params)
+            self.rowcount=self._cur.rowcount
             try:
                 if sql.strip().upper().startswith("INSERT"):
                     self._cur.execute("SELECT lastval()")
-                    self.lastrowid = self._cur.fetchone()[0]
-            except Exception:
-                pass
+                    self.lastrowid=self._cur.fetchone()[0]
+            except: pass
         except Exception as e:
             self._conn.rollback()
             raise e
         return self
-
     def fetchone(self):
-        row = self._cur.fetchone()
-        return PgRow(row) if row else None
-
-    def fetchall(self):
-        return [PgRow(r) for r in self._cur.fetchall()]
-
+        row=self._cur.fetchone(); return PgRow(row) if row else None
+    def fetchall(self): return [PgRow(r) for r in self._cur.fetchall()]
     def __iter__(self):
-        for row in self._cur:
-            yield PgRow(row)
-
+        for row in self._cur: yield PgRow(row)
 
 class PgConn:
-    def __init__(self, conn):
-        self._conn = conn
-        self._cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-    def execute(self, sql, params=()):
-        return PgCursor(self._cur, self._conn).execute(sql, params)
-
-    def executescript(self, sql):
-        depth = 0
-        current = ""
-        statements = []
+    def __init__(self,conn,pool=None):
+        self._conn=conn; self._cur=conn.cursor(); self._pool=pool; self._closed=False
+    def execute(self,sql,params=()):
+        return PgCursor(self._cur,self._conn).execute(sql,params)
+    def executescript(self,sql):
+        depth=0; current=""; statements=[]
         for char in sql:
-            if char == '(':
-                depth += 1
-            elif char == ')':
-                depth -= 1
-            if char == ';' and depth == 0:
-                if current.strip():
-                    statements.append(current.strip())
-                current = ""
-            else:
-                current += char
-        if current.strip():
-            statements.append(current.strip())
-        cur = PgCursor(self._cur, self._conn)
+            if char=='(': depth+=1
+            elif char==')': depth-=1
+            if char==';' and depth==0:
+                if current.strip(): statements.append(current.strip())
+                current=""
+            else: current+=char
+        if current.strip(): statements.append(current.strip())
+        cur=PgCursor(self._cur,self._conn)
         for stmt in statements:
-            if stmt:
-                cur.execute(stmt)
+            if stmt: cur.execute(stmt)
         return cur
-
-    def commit(self):
-        self._conn.commit()
-
+    def commit(self): self._conn.commit()
     def close(self):
-        """raw conn.close() করার বদলে pool-এ ফেরত (putconn) দেওয়া হয়, connection leak এড়াতে।"""
+        # Return the connection to the pool instead of actually closing the
+        # TCP/SSL socket, so it can be safely reused by the next request.
+        if self._closed:
+            return
+        self._closed = True
         try:
             self._cur.close()
         except Exception:
             pass
-        try:
-            _get_pool().putconn(self._conn)
-        except Exception:
+        if self._pool is not None:
             try:
-                self._conn.close()
+                self._conn.rollback()
             except Exception:
                 pass
+            try:
+                self._pool.putconn(self._conn)
+            except Exception:
+                try: self._conn.close()
+                except Exception: pass
+        else:
+            try: self._conn.close()
+            except Exception: pass

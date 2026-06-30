@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request, redirect
+from flask import Flask, jsonify, request, redirect, g
 from flask_cors import CORS
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime
@@ -9,7 +9,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
 from zoneinfo import ZoneInfo
 import os, json, requests, logging, time, urllib.parse
-from db_postgres import get_db, release_db_connection
+import db_postgres as _db_postgres
 
 from google_auth import verify_google_token
 from notifications import register_notification_routes
@@ -23,16 +23,49 @@ from ai import generate_caption, generate_seo
 
 load_dotenv()
 app = Flask(__name__)
+
+@app.errorhandler(Exception)
+def handle_any_error(e):
+    import traceback
+    logging.error("Unhandled exception: %s\n%s", e, traceback.format_exc())
+    code = getattr(e, "code", 500)
+    if not isinstance(code, int):
+        code = 500
+    return jsonify({"success": False, "error": str(e)}), code
 CORS(app)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
-scheduler = BackgroundScheduler(timezone="Asia/Dhaka")
-scheduler.start()
+def get_db():
+    """One DB connection per request (or per background-job app-context),
+    reused across every get_db() call in that request, and returned to the
+    pool automatically when the request/app-context ends. This replaces the
+    old behaviour of opening a brand-new unclosed connection on every call,
+    which was exhausting Render's free Postgres connection limit."""
+    if "db" not in g:
+        g.db = _db_postgres.get_db()
+    return g.db
 
 @app.teardown_appcontext
-def _close_db_connection(exception=None):
-    """প্রতিটা request শেষে DB connection pool-এ ফেরত দেওয়া হয় — connection leak ঠেকানোর জন্য।"""
-    release_db_connection()
+def _close_db(exception=None):
+    db = g.pop("db", None)
+    if db is not None:
+        try:
+            db.close()
+        except Exception:
+            logging.exception("Failed to release DB connection")
+
+def _job(fn):
+    """Wrap an APScheduler job so it runs inside a Flask app context.
+    This lets it use the same per-call DB connection caching/release as
+    normal requests, instead of leaking a connection on every run."""
+    @wraps(fn)
+    def wrapper(*a, **kw):
+        with app.app_context():
+            return fn(*a, **kw)
+    return wrapper
+
+scheduler = BackgroundScheduler(timezone="Asia/Dhaka")
+scheduler.start()
 
 UPLOAD_DIR = os.path.join(app.static_folder or "static", "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -126,9 +159,6 @@ def init_db():
         times TEXT DEFAULT '[]',
         last_run_marker TEXT,
         status TEXT DEFAULT 'not_configured',
-        last_error TEXT,
-        custom_caption TEXT,
-        use_ai_title INTEGER DEFAULT 0,
         created_at TEXT DEFAULT CURRENT_TIMESTAMP
     );
     CREATE TABLE IF NOT EXISTS workflow_posted_items (
@@ -171,18 +201,7 @@ def init_db():
             (admin_u, generate_password_hash(admin_p), "admin")
         )
     db.execute("INSERT INTO settings (key,value) VALUES ('credits','0') ON CONFLICT (key) DO NOTHING")
-    # ── Migration: পুরনো deployment-এ workflows টেবিলে নতুন কলাম যুক্ত করা ──
-    for coldef in [
-        "last_error TEXT",
-        "custom_caption TEXT",
-        "use_ai_title INTEGER DEFAULT 0",
-    ]:
-        try:
-            db.execute(f"ALTER TABLE workflows ADD COLUMN IF NOT EXISTS {coldef}")
-        except Exception as e:
-            logging.warning(f"Migration skip ({coldef}): {e}")
     db.commit()
-    db.close()
 
 init_db()
 
@@ -261,10 +280,6 @@ DOW_MAP = {0:"MO",1:"TU",2:"WE",3:"TH",4:"FR",5:"SA",6:"SU"}
 # ACCOUNT SYNC & WORKFLOW ENGINE
 # ════════════════════════════════════════════════
 def _sync_all_accounts():
-    with app.app_context():
-        return _sync_all_accounts_impl()
-
-def _sync_all_accounts_impl():
     db = get_db()
     accs = db.execute("SELECT * FROM accounts WHERE platform='Facebook'").fetchall()
     synced = 0
@@ -309,11 +324,6 @@ def execute_workflow(workflow_id):
     user = db.execute("SELECT * FROM users WHERE id=?", (w["user_id"],)).fetchone()
     if not user: return
 
-    def _fail(msg):
-        db.execute("UPDATE workflows SET active=0, status='not_configured', last_error=? WHERE id=?", (msg, workflow_id))
-        db.commit()
-        send_telegram(f"⚠️ Workflow #{workflow_id} ({acc['name']}): {msg}")
-
     n = w["videos_per_run"] or 1
     posted_ids = {r["source_item_id"] for r in db.execute(
         "SELECT source_item_id FROM workflow_posted_items WHERE workflow_id=?", (workflow_id,)
@@ -321,17 +331,13 @@ def execute_workflow(workflow_id):
 
     candidates = []
     if w["source_type"] == "drive":
-        if not user.get("drive_key_json"):
-            _fail("Google Drive key configure করা হয়নি — My Profile → Drive Key upload করুন")
-            return
         try:
             files = list_videos(w["source_value"], user_drive_json=user["drive_key_json"])
+            files = list(reversed(files))
+            candidates = [f for f in files if f["id"] not in posted_ids][:n]
         except Exception as e:
             logging.error(f"Drive list error for workflow {workflow_id}: {e}")
-            _fail(f"Drive ফোল্ডার পড়তে ব্যর্থ: {e}")
             return
-        files = list(reversed(files))
-        candidates = [f for f in files if f["id"] not in posted_ids][:n]
     elif w["source_type"] == "tiktok":
         username = w["source_value"].rstrip("/").split("@")[-1].split("/")[0]
         videos = scrape_tiktok_profile(username, limit=30)
@@ -339,52 +345,32 @@ def execute_workflow(workflow_id):
         candidates = [v for v in videos if v["id"] not in posted_ids][:n]
 
     if not candidates:
-        if w["source_type"] == "drive":
-            _fail("নতুন ভিডিও পাওয়া যায়নি — ফোল্ডারে video নেই, অথবা সব আগেই পোস্ট হয়ে গেছে। (নোট: এখানে Folder link দিতে হবে, একটা single file link নয়)")
-        else:
-            _fail("নতুন ভিডিও পাওয়া যায়নি — সব আগেই পোস্ট হয়ে গেছে")
+        db.execute("UPDATE workflows SET active=0, status='not_configured' WHERE id=?", (workflow_id,))
+        db.commit()
+        send_telegram(f"⚠️ Workflow #{workflow_id} ({acc['name']}): ভিডিও শেষ, auto-paused")
         return
-
-    custom_caption = (w.get("custom_caption") or "").strip()
-    use_ai_title = bool(w.get("use_ai_title"))
 
     for item in candidates:
         if w["source_type"] == "drive":
             video_url = item.get("webContentLink") or get_public_url(item["id"])
-            filename_title = os.path.splitext(item["name"])[0]
-        else:
-            filename_title = (item.get("title") or "Video")[:80]
-
-        # ── Title/caption priority: custom_caption > AI SEO title > filename ──
-        if custom_caption:
-            title = custom_caption
-        elif use_ai_title:
-            seo = generate_seo(filename_title, platform="Facebook")
-            title = seo["seo_title"] if seo and seo.get("seo_title") else filename_title
-        else:
-            title = filename_title
-
-        if w["source_type"] == "drive":
+            title = os.path.splitext(item["name"])[0]
             ok, msg = facebook_post_video(acc["token"], acc["page_id"], title, video_url)
             _record_workflow_post(db, w, acc, item["id"], title, ok, msg)
             if ok and w["success_folder_id"]:
                 move_to_success(item["id"], w["success_folder_id"], user_drive_json=user["drive_key_json"])
         else:
             dl_ok, path = download_tiktok(item["url"])
+            title = (item.get("title") or "Video")[:80]
             if not dl_ok:
                 _record_workflow_post(db, w, acc, item["id"], title, False, f"Download failed: {path}")
                 continue
             ok, msg = facebook_post_video_file(acc["token"], acc["page_id"], title, path)
             _record_workflow_post(db, w, acc, item["id"], title, ok, msg)
 
-    db.execute("UPDATE workflows SET status='active', last_error=NULL WHERE id=?", (workflow_id,))
+    db.execute("UPDATE workflows SET status='active' WHERE id=?", (workflow_id,))
     db.commit()
 
 def run_workflow_engine():
-    with app.app_context():
-        _run_workflow_engine_impl()
-
-def _run_workflow_engine_impl():
     db = get_db()
     rows = db.execute("SELECT * FROM workflows WHERE active=1").fetchall()
     for w in rows:
@@ -408,17 +394,13 @@ def _run_workflow_engine_impl():
         except Exception as e:
             logging.error(f"Workflow {w['id']} run error: {e}")
 
-scheduler.add_job(run_workflow_engine, "interval", minutes=1, id="workflow_engine", replace_existing=True)
-scheduler.add_job(_sync_all_accounts, "interval", hours=6, id="account_sync", replace_existing=True)
+scheduler.add_job(_job(run_workflow_engine), "interval", minutes=1, id="workflow_engine", replace_existing=True)
+scheduler.add_job(_job(_sync_all_accounts), "interval", hours=6, id="account_sync", replace_existing=True)
 
 # ════════════════════════════════════════════════
 # SCHEDULE JOB RUNNER
 # ════════════════════════════════════════════════
 def run_post_job(schedule_id):
-    with app.app_context():
-        _run_post_job_impl(schedule_id)
-
-def _run_post_job_impl(schedule_id):
     db = get_db()
     row = db.execute("SELECT * FROM schedules WHERE id=?", (schedule_id,)).fetchone()
     if not row: return
@@ -865,7 +847,7 @@ def create_schedule():
     db.commit()
     try:
         run_dt = datetime.fromisoformat(d["scheduled_time"])
-        scheduler.add_job(run_post_job, "date", run_date=run_dt, args=[sch_id], id=f"post_{sch_id}", replace_existing=True)
+        scheduler.add_job(_job(run_post_job), "date", run_date=run_dt, args=[sch_id], id=f"post_{sch_id}", replace_existing=True)
     except Exception as e:
         logging.warning(f"Schedule job add failed: {e}")
     return jsonify({"success": True, "id": sch_id})
@@ -924,8 +906,6 @@ def _serialize_workflow(r):
     d["days_of_week"] = json.loads(d["days_of_week"] or "[]")
     d["times"] = json.loads(d["times"] or "[]")
     d["active"] = bool(d["active"])
-    d["use_ai_title"] = bool(d.get("use_ai_title"))
-    d["custom_caption"] = d.get("custom_caption") or ""
     return d
 
 @app.route("/api/workflows", methods=["GET"])
@@ -955,18 +935,15 @@ def save_workflow():
         int(d.get("videos_per_run",1)), active, d.get("repeat_mode","everyday"),
         json.dumps(d.get("days_of_week",[])), d.get("timezone","Asia/Dhaka"),
         json.dumps(d.get("times",[])), status,
-        d.get("custom_caption",""), 1 if d.get("use_ai_title") else 0,
     )
     if d.get("id"):
         db.execute("""UPDATE workflows SET user_id=?,account_id=?,source_type=?,source_value=?,success_folder_id=?,
-                       videos_per_run=?,active=?,repeat_mode=?,days_of_week=?,timezone=?,times=?,status=?,
-                       custom_caption=?,use_ai_title=?,last_error=NULL WHERE id=? AND user_id=?""",
+                       videos_per_run=?,active=?,repeat_mode=?,days_of_week=?,timezone=?,times=?,status=? WHERE id=? AND user_id=?""",
                    args + (d["id"], uid()))
         wid = d["id"]
     else:
         cur = db.execute("""INSERT INTO workflows (user_id,account_id,source_type,source_value,success_folder_id,
-                             videos_per_run,active,repeat_mode,days_of_week,timezone,times,status,
-                             custom_caption,use_ai_title) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", args)
+                             videos_per_run,active,repeat_mode,days_of_week,timezone,times,status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", args)
         wid = cur.lastrowid
     db.commit()
     return jsonify({"success": True, "id": wid})
@@ -987,10 +964,7 @@ def toggle_workflow(wid):
     w = db.execute("SELECT active FROM workflows WHERE id=? AND user_id=?", (wid, uid())).fetchone()
     if not w: return jsonify({"success": False}), 404
     new_active = 0 if w["active"] else 1
-    if new_active:
-        db.execute("UPDATE workflows SET active=1, status='active', last_error=NULL WHERE id=?", (wid,))
-    else:
-        db.execute("UPDATE workflows SET active=0, status='paused' WHERE id=?", (wid,))
+    db.execute("UPDATE workflows SET active=?, status=? WHERE id=?", (new_active, "active" if new_active else "paused", wid))
     db.commit()
     return jsonify({"success": True, "active": bool(new_active)})
 
@@ -1000,14 +974,8 @@ def run_workflow_now(wid):
     # Verify ownership
     w = get_db().execute("SELECT id FROM workflows WHERE id=? AND user_id=?", (wid, uid())).fetchone()
     if not w: return jsonify({"success": False, "error": "Not found"}), 404
-    try:
-        execute_workflow(wid)
-        after = get_db().execute("SELECT status, last_error FROM workflows WHERE id=?", (wid,)).fetchone()
-        if after and after["status"] == "not_configured" and after["last_error"]:
-            return jsonify({"success": False, "error": after["last_error"]})
-        return jsonify({"success": True})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
+    try: execute_workflow(wid); return jsonify({"success": True})
+    except Exception as e: return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route("/api/workflows/bulk-toggle", methods=["POST"])
 @auth_required
@@ -1113,18 +1081,28 @@ def get_settings_route():
 @app.route("/api/settings", methods=["POST"])
 @admin_required
 def save_settings():
-    db = get_db()
-    for k, v in (request.json or {}).items():
-        if k in ("admin_password", "admin_username"): continue
-        v = str(v) if not isinstance(v, str) else v
-        v = str(v) if not isinstance(v, str) else v
-        existing = db.execute("SELECT key FROM settings WHERE key=?", (k,)).fetchone()
-        if existing:
-            db.execute("UPDATE settings SET value=? WHERE key=?", (v, k))
-        else:
-            db.execute("INSERT INTO settings (key,value) VALUES (?,?)", (k, v))
-    db.commit()
-    return jsonify({"success": True})
+    try:
+        db = get_db()
+        incoming = request.json or {}
+        for k, v in incoming.items():
+            if k in ("admin_password", "admin_username"):
+                continue
+            if v is None:
+                v = ""
+            elif isinstance(v, bool):
+                v = "1" if v else "0"
+            elif not isinstance(v, str):
+                v = str(v)
+            row = db.execute("SELECT key FROM settings WHERE key=?", (k,)).fetchone()
+            if row:
+                db.execute("UPDATE settings SET value=? WHERE key=?", (v, k))
+            else:
+                db.execute("INSERT INTO settings (key,value) VALUES (?,?)", (k, v))
+        db.commit()
+        return jsonify({"success": True})
+    except Exception as e:
+        logging.exception("save_settings failed")
+        return jsonify({"success": False, "error": str(e)}), 400
 
 @app.route("/api/settings/auto-sync", methods=["POST"])
 @admin_required
@@ -1134,7 +1112,7 @@ def toggle_auto_sync():
     db.execute("INSERT INTO settings (key,value) VALUES ('auto_sync',?) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", ("1" if enabled else "0",))
     db.commit()
     if enabled:
-        try: scheduler.add_job(_sync_all_accounts, "interval", hours=6, id="account_sync", replace_existing=True)
+        try: scheduler.add_job(_job(_sync_all_accounts), "interval", hours=6, id="account_sync", replace_existing=True)
         except: pass
     else:
         try: scheduler.remove_job("account_sync")
