@@ -1,4 +1,4 @@
-from flask import Flask, jsonify, request, redirect, g
+from flask import Flask, jsonify, request, redirect
 from flask_cors import CORS
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime
@@ -9,7 +9,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from functools import wraps
 from zoneinfo import ZoneInfo
 import os, json, requests, logging, time, urllib.parse
-import db_postgres as _db_postgres
+from db_postgres import get_db
 
 from google_auth import verify_google_token
 from notifications import register_notification_routes
@@ -35,35 +35,6 @@ def handle_any_error(e):
 CORS(app)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
-def get_db():
-    """One DB connection per request (or per background-job app-context),
-    reused across every get_db() call in that request, and returned to the
-    pool automatically when the request/app-context ends. This replaces the
-    old behaviour of opening a brand-new unclosed connection on every call,
-    which was exhausting Render's free Postgres connection limit."""
-    if "db" not in g:
-        g.db = _db_postgres.get_db()
-    return g.db
-
-@app.teardown_appcontext
-def _close_db(exception=None):
-    db = g.pop("db", None)
-    if db is not None:
-        try:
-            db.close()
-        except Exception:
-            logging.exception("Failed to release DB connection")
-
-def _job(fn):
-    """Wrap an APScheduler job so it runs inside a Flask app context.
-    This lets it use the same per-call DB connection caching/release as
-    normal requests, instead of leaking a connection on every run."""
-    @wraps(fn)
-    def wrapper(*a, **kw):
-        with app.app_context():
-            return fn(*a, **kw)
-    return wrapper
-
 scheduler = BackgroundScheduler(timezone="Asia/Dhaka")
 scheduler.start()
 
@@ -78,7 +49,7 @@ TOKEN_MAX_AGE = 7 * 24 * 3600
 # DATABASE
 # ════════════════════════════════════════════════
 def init_db():
-    db = _db_postgres.get_db()
+    db = get_db()
     db.executescript("""
     CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -202,7 +173,6 @@ def init_db():
         )
     db.execute("INSERT INTO settings (key,value) VALUES ('credits','0') ON CONFLICT (key) DO NOTHING")
     db.commit()
-    db.close()
 
 init_db()
 
@@ -222,9 +192,7 @@ def auth_required(f):
             return jsonify({"success": False, "error": "Session মেয়াদ শেষ"}), 401
         except BadSignature:
             return jsonify({"success": False, "error": "অবৈধ session"}), 401
-        db = get_db()
-        db.rollback()
-        user = db.execute("SELECT * FROM users WHERE id=? AND is_active=1", (payload["uid"],)).fetchone()
+        user = get_db().execute("SELECT * FROM users WHERE id=? AND is_active=1", (payload["uid"],)).fetchone()
         if not user:
             return jsonify({"success": False, "error": "User পাওয়া যায়নি"}), 401
         request.current_user = dict(user)
@@ -242,9 +210,7 @@ def admin_required(f):
             payload = serializer.loads(token, max_age=TOKEN_MAX_AGE)
         except (SignatureExpired, BadSignature):
             return jsonify({"success": False, "error": "অবৈধ session"}), 401
-        db = get_db()
-        db.rollback()
-        user = db.execute("SELECT * FROM users WHERE id=? AND is_active=1", (payload["uid"],)).fetchone()
+        user = get_db().execute("SELECT * FROM users WHERE id=? AND is_active=1", (payload["uid"],)).fetchone()
         if not user or user["role"] != "admin":
             return jsonify({"success": False, "error": "Admin access প্রয়োজন"}), 403
         request.current_user = dict(user)
@@ -399,8 +365,8 @@ def run_workflow_engine():
         except Exception as e:
             logging.error(f"Workflow {w['id']} run error: {e}")
 
-scheduler.add_job(_job(run_workflow_engine), "interval", minutes=1, id="workflow_engine", replace_existing=True)
-scheduler.add_job(_job(_sync_all_accounts), "interval", hours=6, id="account_sync", replace_existing=True)
+scheduler.add_job(run_workflow_engine, "interval", minutes=1, id="workflow_engine", replace_existing=True)
+scheduler.add_job(_sync_all_accounts, "interval", hours=6, id="account_sync", replace_existing=True)
 
 # ════════════════════════════════════════════════
 # SCHEDULE JOB RUNNER
@@ -505,6 +471,41 @@ def auth_google():
         "success": True, "token": token_str,
         "username": user["username"], "role": user["role"],
         "user_id": user["id"], "picture": info["picture"],
+    })
+
+
+# ════════════════════════════════════════════════
+# EMAIL REGISTRATION
+# ════════════════════════════════════════════════
+@app.route("/api/auth/register", methods=["POST"])
+def auth_register():
+    d = request.json or {}
+    username = (d.get("username") or "").strip()
+    email    = (d.get("email") or "").strip().lower()
+    password = d.get("password") or ""
+
+    if not username or not email or not password:
+        return jsonify({"success": False, "error": "সব field পূরণ করুন"}), 400
+    if len(password) < 6:
+        return jsonify({"success": False, "error": "Password কমপক্ষে 6 অক্ষর হতে হবে"}), 400
+
+    db = get_db()
+    if db.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone():
+        return jsonify({"success": False, "error": "এই username ইতিমধ্যে নেওয়া হয়েছে"}), 400
+    if db.execute("SELECT id FROM users WHERE email=?", (email,)).fetchone():
+        return jsonify({"success": False, "error": "এই email ইতিমধ্যে registered"}), 400
+
+    cur = db.execute(
+        "INSERT INTO users (username, password_hash, email, role, credits, is_active) VALUES (?,?,?,?,?,?)",
+        (username, generate_password_hash(password), email, "user", 0, 1)
+    )
+    db.commit()
+    user_id = cur.lastrowid
+
+    token = serializer.dumps({"uid": user_id})
+    return jsonify({
+        "success": True, "token": token,
+        "username": username, "role": "user", "user_id": user_id
     })
 
 # ════════════════════════════════════════════════
@@ -852,7 +853,7 @@ def create_schedule():
     db.commit()
     try:
         run_dt = datetime.fromisoformat(d["scheduled_time"])
-        scheduler.add_job(_job(run_post_job), "date", run_date=run_dt, args=[sch_id], id=f"post_{sch_id}", replace_existing=True)
+        scheduler.add_job(run_post_job, "date", run_date=run_dt, args=[sch_id], id=f"post_{sch_id}", replace_existing=True)
     except Exception as e:
         logging.warning(f"Schedule job add failed: {e}")
     return jsonify({"success": True, "id": sch_id})
@@ -1086,40 +1087,33 @@ def get_settings_route():
 @app.route("/api/settings", methods=["POST"])
 @admin_required
 def save_settings():
-    incoming = request.json or {}
-    last_err = None
-    for attempt in range(2):
-        try:
-            db = get_db()
-            db.rollback()  # clear any leftover aborted-transaction state before we start
-            try:
-                logging.info(f"[settings-debug] attempt={attempt} backend_pid={db._conn.get_backend_pid()} tx_status_after_rollback={db._conn.get_transaction_status()}")
-            except Exception:
-                pass
-            for k, v in incoming.items():
-                if k in ("admin_password", "admin_username"):
-                    continue
-                if v is None:
-                    v = ""
-                elif isinstance(v, bool):
-                    v = "1" if v else "0"
-                elif not isinstance(v, str):
-                    v = str(v)
-                row = db.execute("SELECT key FROM settings WHERE key=?", (k,)).fetchone()
-                if row:
-                    db.execute("UPDATE settings SET value=? WHERE key=?", (v, k))
-                else:
-                    db.execute("INSERT INTO settings (key,value) VALUES (?,?)", (k, v))
-            db.commit()
-            return jsonify({"success": True})
-        except Exception as e:
-            last_err = e
-            logging.exception(f"save_settings failed (attempt {attempt+1})")
-            try:
-                get_db().rollback()
-            except Exception:
-                pass
-    return jsonify({"success": False, "error": str(last_err)}), 400
+    try:
+        db = get_db()
+        incoming = request.json or {}
+        for k, v in incoming.items():
+            if k in ("admin_password", "admin_username"):
+                continue
+            # Coerce to string for TEXT column
+            if v is None:
+                v = ""
+            elif isinstance(v, bool):
+                v = "1" if v else "0"
+            elif not isinstance(v, str):
+                v = str(v)
+            row = db.execute("SELECT key FROM settings WHERE key=?", (k,)).fetchone()
+            if row:
+                db.execute("UPDATE settings SET value=? WHERE key=?", (v, k))
+            else:
+                db.execute("INSERT INTO settings (key,value) VALUES (?,?)", (k, v))
+        db.commit()
+        return jsonify({"success": True})
+    except Exception as e:
+        db_inst = locals().get("db")
+        if db_inst:
+            try: db_inst.rollback()
+            except: pass
+        logging.exception("save_settings failed")
+        return jsonify({"success": False, "error": str(e)}), 400
 
 @app.route("/api/settings/auto-sync", methods=["POST"])
 @admin_required
@@ -1129,7 +1123,7 @@ def toggle_auto_sync():
     db.execute("INSERT INTO settings (key,value) VALUES ('auto_sync',?) ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value", ("1" if enabled else "0",))
     db.commit()
     if enabled:
-        try: scheduler.add_job(_job(_sync_all_accounts), "interval", hours=6, id="account_sync", replace_existing=True)
+        try: scheduler.add_job(_sync_all_accounts, "interval", hours=6, id="account_sync", replace_existing=True)
         except: pass
     else:
         try: scheduler.remove_job("account_sync")

@@ -56,6 +56,9 @@ export const googleLogin = async (credential) => {
   if (data.success) { setToken(data.token); setUserInfo({ username: data.username, role: data.role, user_id: data.user_id, picture: data.picture }) }
   return data
 }
+export const register = (username, email, password) =>
+  req("/auth/register", { method:"POST", body:JSON.stringify({ username, email, password }) })
+
 export const verifyToken = () => req('/auth/verify')
 export const getMe       = () => req('/auth/me')
 export const logout      = () => { setToken(''); setUserInfo(null) }
