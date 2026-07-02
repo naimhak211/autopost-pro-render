@@ -69,7 +69,7 @@ class PgConn:
         for s in stmts:
             if s:
                 try:
-                    self.execute(s)
+                    self._cur.execute(self._translate(s))
                     self._conn.commit()
                 except Exception as e:
                     self._conn.rollback()
