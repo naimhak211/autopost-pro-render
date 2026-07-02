@@ -59,7 +59,12 @@ class PgConn:
         if cur.strip(): stmts.append(cur.strip())
         last=None
         for s in stmts:
-            if s: last=PgCursor(self._conn).execute(s)
+            if s:
+                try:
+                    last=PgCursor(self._conn).execute(s)
+                    self._conn.commit()
+                except Exception as e:
+                    self._conn.rollback()
         return last
     def commit(self): self._conn.commit()
     def rollback(self): self._conn.rollback()
