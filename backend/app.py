@@ -1090,28 +1090,22 @@ def save_settings():
     try:
         db = get_db()
         incoming = request.json or {}
+        keys_vals = []
         for k, v in incoming.items():
             if k in ("admin_password", "admin_username"):
                 continue
-            # Coerce to string for TEXT column
-            if v is None:
-                v = ""
-            elif isinstance(v, bool):
-                v = "1" if v else "0"
-            elif not isinstance(v, str):
-                v = str(v)
-            row = db.execute("SELECT key FROM settings WHERE key=?", (k,)).fetchone()
-            if row:
-                db.execute("UPDATE settings SET value=? WHERE key=?", (v, k))
-            else:
-                db.execute("INSERT INTO settings (key,value) VALUES (?,?)", (k, v))
+            if v is None: v = ""
+            elif isinstance(v, bool): v = "1" if v else "0"
+            elif not isinstance(v, str): v = str(v)
+            keys_vals.append((k, v))
+        for k, v in keys_vals:
+            db.execute("DELETE FROM settings WHERE key=%s", (k,))
+            db.execute("INSERT INTO settings (key,value) VALUES (%s,%s)", (k, v))
         db.commit()
         return jsonify({"success": True})
     except Exception as e:
-        db_inst = locals().get("db")
-        if db_inst:
-            try: db_inst.rollback()
-            except: pass
+        try: db.rollback()
+        except: pass
         logging.exception("save_settings failed")
         return jsonify({"success": False, "error": str(e)}), 400
 
@@ -1287,3 +1281,5 @@ def backup_import():
 if __name__ == "__main__":
     port = int(os.getenv("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=os.getenv("FLASK_DEBUG","false").lower()=="true")
+
+# patch init_db to use autocommit
